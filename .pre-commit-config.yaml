@@ -1,0 +1,19 @@
+repos:
+- repo: https://github.com/astral-sh/ruff-pre-commit
+  rev: v0.15.6
+  hooks:
+    - id: ruff-check
+      args: [
+        --fix,                               # Automatically fix safe violations
+        --select, "E",                       # pycodestyle errors (PEP8)
+        --select, "F",                       # Pyflakes (logic & syntax errors)
+        --select, "UP",                      # pyupgrade (modernize syntax)
+        --select, "B",                       # flake8-bugbear (common bugs)
+        --select, "SIM",                     # flake8-simplify (cleaner code)
+        --select, "I",                       # isort (import sorting)
+        --ignore, "E501",                    # Let formatter handle line length
+        --ignore, "F401",                    # (Optional) Ignore unused imports during dev
+        --target-version, "py310",           # Set Python version for upgrades
+      ]
+    - id: ruff-format
+      # Standard formatter (Black-compatible) - no extra args needed
