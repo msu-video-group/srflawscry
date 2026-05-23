@@ -1,3 +1,16 @@
+---
+title: SR Flaw Scry - Artifact Detection for Super-Resolution
+short_description: Find where super-resolution goes wrong and artifacts appear.
+emoji: 🔎
+colorFrom: blue
+colorTo: gray
+sdk: gradio
+sdk_version: "6.14.0"
+python_version: "3.11"
+app_file: app.py
+license: bsd-3-clause
+---
+
 <p align="center">
   <h1 align="center">SR Flaw Scry: Artifact Detection for Super-Resolution</h1>
   <h3 align="center">
