@@ -14,6 +14,7 @@ from torchvision.utils import save_image
 from srflawscry.utils.device import empty_device_cache
 from srflawscry.utils.images import read_image_tensor
 
+from .dists_map import compute_dists_map
 from .masks import filter_connected_components_tensor
 from .triplet_loss_model import TripletModel
 
@@ -31,6 +32,14 @@ class WASD(nn.Module, PyTorchModelHubMixin):
         encoder: str = "mobnet",
         refiner: str = "unet",
         crop_size: int = 100,
+        nafnet_variant: str = "default",
+        use_dists_map: bool = False,
+        dists_patch_size: int = 64,
+        dists_stride: int = 32,
+        dists_batch_size: int = 32,
+        inference_tile_size: int = 0,
+        inference_tile_overlap: int = 64,
+        artifact_threshold: float = 0.92,
     ) -> None:
         super().__init__()
 
@@ -40,11 +49,17 @@ class WASD(nn.Module, PyTorchModelHubMixin):
         model_config.use_norm = use_norm
         model_config.encoder = encoder
         model_config.refiner = refiner
+        model_config.nafnet_pretrained = False
+        model_config.extra_mask_dirs = []
 
         model = TripletModel(
             encoder_params=model_config,
             margin=margin,
             prominence_head_hidden=prominence_head_hidden,
+            extra_mask_channels=1 if use_dists_map else 0,
+            nafnet_variant=nafnet_variant,
+            inference_tile_size=inference_tile_size,
+            inference_tile_overlap=inference_tile_overlap,
         )
 
         self.model = model
@@ -57,11 +72,17 @@ class WASD(nn.Module, PyTorchModelHubMixin):
             ]
         )
         self.crop_size = crop_size
-        self.artifact_threshold = 0.92
+        self.use_dists_map = use_dists_map
+        self.dists_patch_size = dists_patch_size
+        self.dists_stride = dists_stride
+        self.dists_batch_size = dists_batch_size
+        self.artifact_threshold = artifact_threshold
         self.min_mask_area_fraction = 0.0005
         self.max_inference_size = 1024
+        object.__setattr__(self, "_dists_metric", None)
 
     def close(self) -> None:
+        object.__setattr__(self, "_dists_metric", None)
         self.cpu()
         gc.collect()
         empty_device_cache()
@@ -73,34 +94,57 @@ class WASD(nn.Module, PyTorchModelHubMixin):
         threshold: float | None = None,
     ) -> torch.FloatTensor:
         threshold = self.artifact_threshold if threshold is None else threshold
-        image = self.transform(uint8_rgb_xN_image).unsqueeze(0).to(self.device)
-        source = self.transform(uint8_rgb_x1_source).unsqueeze(0).to(self.device)
+        image_rgb = uint8_rgb_xN_image.float().div(255).unsqueeze(0).to(self.device)
+        source_rgb = uint8_rgb_x1_source.float().div(255).unsqueeze(0).to(self.device)
 
-        if image.shape[-2] % source.shape[-2] or image.shape[-1] % source.shape[-1]:
+        if (
+            image_rgb.shape[-2] % source_rgb.shape[-2]
+            or image_rgb.shape[-1] % source_rgb.shape[-1]
+        ):
             raise ValueError(
                 f"upscaled image must be N times larger than the source image, "
-                f"but got {image.shape[-2]}x{image.shape[-1]} upscaled image and "
-                f"{source.shape[-2]}x{source.shape[-1]} source image",
+                f"but got {image_rgb.shape[-2]}x{image_rgb.shape[-1]} upscaled image and "
+                f"{source_rgb.shape[-2]}x{source_rgb.shape[-1]} source image",
             )
-        if image.shape[-2] // source.shape[-2] != image.shape[-1] // source.shape[-1]:
+        if (
+            image_rgb.shape[-2] // source_rgb.shape[-2]
+            != image_rgb.shape[-1] // source_rgb.shape[-1]
+        ):
             raise ValueError(
                 "upscaled image and source image have different aspect ratios"
             )
-        if image.shape[-2] // source.shape[-2] == 1:
+        if image_rgb.shape[-2] // source_rgb.shape[-2] == 1:
             raise ValueError("upscaled image and source image are the same size")
-        scale_factor = image.shape[-2] // source.shape[-2]
+        scale_factor = image_rgb.shape[-2] // source_rgb.shape[-2]
 
-        reference = F.interpolate(
-            source,
+        reference_rgb = F.interpolate(
+            source_rgb,
             scale_factor=scale_factor,
             mode="bicubic",
             align_corners=False,
-        )
+        ).clamp(0.0, 1.0)
+
+        extra_masks = None
+        if self.use_dists_map:
+            extra_masks = compute_dists_map(
+                self._get_dists_metric(),
+                image_rgb,
+                reference_rgb,
+                patch_size=self.dists_patch_size,
+                stride=self.dists_stride,
+                batch_size=self.dists_batch_size,
+            )
+
+        mean = image_rgb.new_tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        std = image_rgb.new_tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        image = (image_rgb - mean) / std
+        reference = (reference_rgb - mean) / std
 
         confidence, _ = self.model(
             image,
             reference=reference,
             artifact_crop_size=self.crop_size,
+            extra_masks=extra_masks,
         )
 
         mask = (confidence > threshold).float()
@@ -156,6 +200,18 @@ class WASD(nn.Module, PyTorchModelHubMixin):
     @property
     def device(self):
         return next(self.parameters()).device
+
+    def _get_dists_metric(self):
+        metric = self._dists_metric
+        if metric is None:
+            from DISTS_pytorch import DISTS
+
+            metric = DISTS().eval().requires_grad_(False).to(self.device)
+            object.__setattr__(self, "_dists_metric", metric)
+        elif next(metric.parameters()).device != self.device:
+            metric = metric.to(self.device)
+            object.__setattr__(self, "_dists_metric", metric)
+        return metric
 
     @staticmethod
     def _resize_for_inference(

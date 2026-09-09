@@ -59,10 +59,9 @@ class MobileNet(nn.Module):
         features = list(original_model.features)
         features[0] = new_first_block
 
-        self.model = nn.Sequential(
-            *features,
-            nn.AdaptiveAvgPool2d((1, 1)),
-        )
+        self.features = nn.Sequential(*features)
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.model = nn.Sequential(self.features, self.pool)
 
         self.feat_dim = original_model.last_channel
 
@@ -73,8 +72,8 @@ class MobileNet(nn.Module):
         )
 
     def forward(self, x):
-        f = self.model(x)
-        f = f.view(-1, self.feat_dim)
+        feat = self.features(x)
+        f = self.pool(feat).view(-1, self.feat_dim)
 
         if self.use_norm:
             f = F.normalize(f, dim=1)

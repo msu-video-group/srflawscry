@@ -28,7 +28,7 @@ class WASDMetric(AbstractMetric):
         mask_name: str = ARTIFACT_MASK_NAME,
         tolerance: float = 0.004,
         reuse_existing_masks: bool = True,
-        detector_threshold: float = 0.92,
+        detector_threshold: float | None = None,
         min_mask_area_fraction: float | None = 0.0005,
     ) -> None:
         self.model_id = model_id

@@ -142,6 +142,10 @@ class TripletModel(torch.nn.Module):
         margin: float = 1.0,
         prominence_head_hidden: int = 256,
         loss_weights=None,
+        extra_mask_channels: int = 0,
+        nafnet_variant: str = "default",
+        inference_tile_size: int = 0,
+        inference_tile_overlap: int = 64,
     ):
         super().__init__()
 
@@ -192,7 +196,10 @@ class TripletModel(torch.nn.Module):
         if isinstance(self.extra_mask_dirs, str):
             self.extra_mask_dirs = [self.extra_mask_dirs]
 
-        refiner_channels = 7 + len(self.extra_mask_dirs)
+        self.extra_mask_channels = int(extra_mask_channels)
+        self.inference_tile_size = int(inference_tile_size)
+        self.inference_tile_overlap = int(inference_tile_overlap)
+        refiner_channels = 7 + self.extra_mask_channels
 
         if encoder_params.refiner == "unet":
             self.refiner = AttentionRefiner(
@@ -203,6 +210,7 @@ class TripletModel(torch.nn.Module):
                 in_channels=refiner_channels,
                 width=32,
                 pretrained=encoder_params.nafnet_pretrained,
+                variant=nafnet_variant,
             )
 
         if loss_weights is None:
@@ -254,6 +262,7 @@ class TripletModel(torch.nn.Module):
         artifact_mask_gt=None,
         artifact_crop_size=256,
         name=None,
+        extra_masks=None,
     ):
 
         if reference is None:
@@ -268,11 +277,22 @@ class TripletModel(torch.nn.Module):
                 return_prominence,
             )
         return self.forward_refiner(
-            anchor, reference, artifact_mask_gt, artifact_crop_size, name
+            anchor,
+            reference,
+            artifact_mask_gt,
+            artifact_crop_size,
+            name,
+            extra_masks,
         )
 
     def forward_refiner(
-        self, image, reference, artifact_mask_gt=None, artifact_crop_size=256, name=None
+        self,
+        image,
+        reference,
+        artifact_mask_gt=None,
+        artifact_crop_size=256,
+        name=None,
+        extra_masks=None,
     ):
 
         device = image.device
@@ -282,8 +302,9 @@ class TripletModel(torch.nn.Module):
                 image, reference, artifact_crop_size, device
             )
 
-        extra_masks = torch.empty(0).to(device)
-        if self.extra_mask_dirs and name:
+        if extra_masks is None:
+            extra_masks = torch.empty(0, device=device)
+        if self.extra_mask_dirs and name and extra_masks.numel() == 0:
             """extra_masks = []
             for tensor_name in name:
                 tensor_masks = []
@@ -341,11 +362,70 @@ class TripletModel(torch.nn.Module):
             while extra_masks.ndim < coarse_mask.ndim:
                 extra_masks = extra_masks.unsqueeze(0)
 
-        refined_mask = self.refiner(
+        if self.extra_mask_channels and extra_masks.numel() == 0:
+            extra_masks = coarse_mask.new_zeros(
+                coarse_mask.shape[0],
+                self.extra_mask_channels,
+                coarse_mask.shape[-2],
+                coarse_mask.shape[-1],
+            )
+
+        refined_mask = self._run_refiner(
             image, reference, [coarse_mask.detach(), extra_masks]
         )
 
         return refined_mask, coarse_mask
+
+    def _run_refiner(self, image, reference, masks):
+        """Run the refiner in overlapping tiles for large inference inputs."""
+        tile_size = self.inference_tile_size
+        height, width = image.shape[-2:]
+        if (
+            self.training
+            or tile_size <= 0
+            or (height <= tile_size and width <= tile_size)
+        ):
+            return self.refiner(image, reference, masks)
+
+        overlap = max(0, min(self.inference_tile_overlap, tile_size - 1))
+        stride = max(1, tile_size - overlap)
+
+        def starts(length):
+            values = list(range(0, max(1, length - tile_size + 1), stride))
+            last = max(0, length - tile_size)
+            if values[-1] != last:
+                values.append(last)
+            return values
+
+        valid_masks = [m for m in masks if m is not None and m.numel() > 0]
+        output = None
+        weights = image.new_zeros((image.shape[0], 1, height, width))
+        axis = torch.linspace(-1, 1, tile_size, device=image.device)
+        yy, xx = torch.meshgrid(axis, axis, indexing="ij")
+        blend = torch.exp(-(xx.square() + yy.square()) / 0.5).view(
+            1, 1, tile_size, tile_size
+        )
+
+        for top in starts(height):
+            for left in starts(width):
+                bottom = min(top + tile_size, height)
+                right = min(left + tile_size, width)
+                tile_h, tile_w = bottom - top, right - left
+                tile_masks = [mask[..., top:bottom, left:right] for mask in valid_masks]
+                tile_out = self.refiner(
+                    image[..., top:bottom, left:right],
+                    reference[..., top:bottom, left:right],
+                    tile_masks,
+                )
+                if output is None:
+                    output = tile_out.new_zeros(
+                        (tile_out.shape[0], tile_out.shape[1], height, width)
+                    )
+                tile_blend = blend[..., :tile_h, :tile_w]
+                output[..., top:bottom, left:right] += tile_out * tile_blend
+                weights[..., top:bottom, left:right] += tile_blend
+
+        return output / weights.clamp(min=1e-6)
 
     def forward_contrastive(
         self,
@@ -433,42 +513,62 @@ class TripletModel(torch.nn.Module):
         Returns:
             torch.Tensor: Artifact mask of shape [B, 1, H, W] with values in [0, 1]
         """
-        batch_size, channels, height, width = images.shape
+        batch_size, _, height, width = images.shape
 
-        num_blocks_h = height // crop_size
-        num_blocks_w = width // crop_size
+        def starts(length):
+            values = list(range(0, max(1, length - crop_size + 1), crop_size))
+            last = max(0, length - crop_size)
+            if values[-1] != last:
+                values.append(last)
+            return values
 
         artifact_mask = torch.zeros(batch_size, 1, height, width, device=device)
+        counts = torch.zeros_like(artifact_mask)
+        previous_mode = self.encoder.training
+        self.encoder.eval()
 
-        for i in range(num_blocks_h):
-            for j in range(num_blocks_w):
-                h_start = i * crop_size
-                h_end = h_start + crop_size
-                w_start = j * crop_size
-                w_end = w_start + crop_size
+        try:
+            for h_start in starts(height):
+                for w_start in starts(width):
+                    h_end = min(h_start + crop_size, height)
+                    w_end = min(w_start + crop_size, width)
 
-                image_blocks = images[:, :, h_start:h_end, w_start:w_end]
-                reference_blocks = reference[:, :, h_start:h_end, w_start:w_end]
+                    image_blocks = images[:, :, h_start:h_end, w_start:w_end]
+                    reference_blocks = reference[:, :, h_start:h_end, w_start:w_end]
+                    if image_blocks.shape[-2:] != (crop_size, crop_size):
+                        image_blocks = F.interpolate(
+                            image_blocks,
+                            size=(crop_size, crop_size),
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+                        reference_blocks = F.interpolate(
+                            reference_blocks,
+                            size=(crop_size, crop_size),
+                            mode="bilinear",
+                            align_corners=False,
+                        )
 
-                with torch.no_grad():
-                    image_embs, _ = self.encoder(image_blocks)
-                    reference_embs, _ = self.encoder(reference_blocks)
+                    with torch.no_grad():
+                        image_embs, _ = self.encoder(image_blocks)
+                        reference_embs, _ = self.encoder(reference_blocks)
 
-                image_embs_norm = F.normalize(image_embs, p=2, dim=1)
-                reference_embs_norm = F.normalize(reference_embs, p=2, dim=1)
-                cosine_similarity = torch.sum(
-                    image_embs_norm * reference_embs_norm, dim=1
-                )
+                    image_embs_norm = F.normalize(image_embs, p=2, dim=1)
+                    reference_embs_norm = F.normalize(reference_embs, p=2, dim=1)
+                    cosine_similarity = torch.sum(
+                        image_embs_norm * reference_embs_norm, dim=1
+                    )
 
-                # cos = 1 -> 0 (no artifact)
-                # cos = -1 -> 1 (artifact)
-                patch_score = (1 - cosine_similarity) / 2
+                    patch_score = ((1 - cosine_similarity) / 2).view(
+                        batch_size, 1, 1, 1
+                    )
+                    artifact_mask[:, :, h_start:h_end, w_start:w_end] += patch_score
+                    counts[:, :, h_start:h_end, w_start:w_end] += 1
+        finally:
+            if previous_mode:
+                self.encoder.train()
 
-                patch_score = patch_score.view(batch_size, 1, 1, 1)
-                artifact_mask[:, :, h_start:h_end, w_start:w_end] = patch_score
-
-        artifact_mask = torch.clamp(artifact_mask, 0.0, 1.0)
-        return artifact_mask
+        return (artifact_mask / counts.clamp(min=1)).clamp(0.0, 1.0)
 
 
 def triplet_loss(

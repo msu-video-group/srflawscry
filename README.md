@@ -48,6 +48,11 @@ where the `sources` folder contains the original low-resolution inputs and the
 Metric computation is supported on CPUs, Apple Silicon Macs, and CUDA-capable GPUs.
 At least **3 GB of VRAM** is recommended for GPU inference.
 
+## 📝 Changelog
+
+- **WASD v1 — 2026-05-24:** Initial release.
+- **WASD v2 — 2026-09-09:** Improved artifact detection.
+
 ## 🚀 Using WASD in Your Project
 
 Our artifact detection metric is called WASD. You can easily add it to your

@@ -266,19 +266,35 @@ class NAFNet(nn.Module):
 
 
 class NAFNetRefiner(nn.Module):
-    def __init__(self, in_channels, width=64, pretrained=False):  # , device=None):
+    def __init__(
+        self,
+        in_channels,
+        width=64,
+        pretrained=False,
+        out_channels: int = 1,
+        variant: str = "default",
+    ):
         super().__init__()
 
-        # self.nafnet = NAFNet(img_channel=in_channels, width=width, # default nafnet \w 36 blocks
-        #                     middle_blk_num=12, enc_blk_nums=[2, 2, 4, 8], dec_blk_nums=[2, 2, 2, 2])
-
-        self.nafnet = NAFNet(
-            img_channel=in_channels,
-            width=width,  # nafnet \w 36 blocks
-            middle_blk_num=4,
-            enc_blk_nums=[1, 1, 1, 25],
-            dec_blk_nums=[1, 1, 1, 1],
-        )
+        self.out_channels = out_channels
+        if variant == "small":
+            self.nafnet = NAFNet(
+                img_channel=in_channels,
+                width=width,
+                middle_blk_num=2,
+                enc_blk_nums=[1, 1, 1, 4],
+                dec_blk_nums=[1, 1, 1, 1],
+            )
+        elif variant == "default":
+            self.nafnet = NAFNet(
+                img_channel=in_channels,
+                width=width,
+                middle_blk_num=4,
+                enc_blk_nums=[1, 1, 1, 25],
+                dec_blk_nums=[1, 1, 1, 1],
+            )
+        else:
+            raise ValueError(f"Unknown NAFNet refiner variant: {variant}")
 
         if pretrained:
             if width != 32 and width != 64:
@@ -430,7 +446,7 @@ class NAFNetRefiner(nn.Module):
 
             # Done: model is initialized with any compatible pretrained params; incompatible parts remain randomly initialized.
 
-        self.final_conv = nn.Conv2d(in_channels, 1, kernel_size=1)  # convert to mask
+        self.final_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
 
     def forward(self, image, reference, coarse_mask):
 
@@ -447,4 +463,4 @@ class NAFNetRefiner(nn.Module):
         output = self.final_conv(output)
         output = torch.sigmoid(output)
 
-        return output.squeeze(dim=1)
+        return output
